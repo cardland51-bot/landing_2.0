@@ -1,260 +1,476 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Cyberpunk Neon Chamber – Smooth Camera</title>
-<style>
-body { margin:0; overflow:hidden; background: radial-gradient(#02020a, #000000);}
-canvas { display:block; touch-action:none; }
-</style>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Interactive Walls – Real-time Ready</title>
+  <style>
+    html,body{height:100%;margin:0;background:#0b0d10;overflow:hidden}
+    canvas{display:block;touch-action:none}
+  </style>
 </head>
 <body>
 <script src="https://cdn.jsdelivr.net/npm/three@0.155.0/build/three.min.js"></script>
 <script>
+/* =========================================================
+   TWEAKS (LABELLED)
+   ========================================================= */
+const ROOM = { w: 200, h: 100, d: 300 };
+const TIER_Y = 0;                // single room for now
+const OVERVIEW = { x: 0, y: 20, z: 180 };
+
+let zoomDist = 240;              // scroll wheel changes this
+const ZOOM_MIN = 90;
+const ZOOM_MAX = 520;
+const ZOOM_STEP = 0.22;
+
+const CAM_STEP = 0.85;           // movement speed
+const LOOK_LERP = 0.06;          // look smoothing
+
+const CENTER_PULL_Z = 40;        // side walls: pull here first
+const CENTER_PULL_THRESH = 6;    // then rotate to side
+
+// ===== Real-time inputs =====
+// Option A: SSE endpoint (best): sends events like {screenId:"front", payload:{...}}
+const SSE_URL = "";              // example: "https://yourdomain.com/sse"
+// Option B: Poll endpoint (fallback): GET /api/screen?id=front
+const POLL_URL = "";             // example: "https://yourdomain.com/api/screen"
+const POLL_MS = 1500;
+
+
+/* =========================================================
+   Scene core
+   ========================================================= */
 let scene, camera, renderer;
-let icons=[], raycaster=new THREE.Raycaster(), mouse=new THREE.Vector2();
-let activeIcon=null, currentTier=0, haloIcon=null;
+let raycaster = new THREE.Raycaster();
+let mouse = new THREE.Vector2();
 
-// Camera targets
-let cameraPosTarget=new THREE.Vector3(0,20,150);
-let cameraLookTarget=new THREE.Vector3(0,20,0);
+let clickables = []; // wall screens
+let focus = null;    // { phase:"pull"|"face", face, lookPoint, camPoint, centerPoint, isSide, wall }
 
-// Audio
-const clickAudio=new Audio("https://www.soundjay.com/button/sounds/button-10.mp3");
-const softTone=new Audio("https://www.soundjay.com/button/sounds/button-16.mp3");
+let cameraPosTarget = new THREE.Vector3(OVERVIEW.x, OVERVIEW.y, OVERVIEW.z);
+let cameraLookTarget = new THREE.Vector3(0, 20, 0);
 
-// Particle bursts
-let bursts=[];
-function createBurst(position){
-    const geometry = new THREE.BufferGeometry();
-    const positions = [];
-    const count = 20;
-    for(let i=0;i<count;i++){ positions.push(position.x, position.y, position.z); }
-    geometry.setAttribute('position', new THREE.Float32BufferAttribute(positions,3));
-    const material = new THREE.PointsMaterial({color:0xffff33, size:5, transparent:true, opacity:0.8});
-    const points = new THREE.Points(geometry, material);
-    points.userData.life=0;
-    points.userData.vels=[];
-    for(let i=0;i<count;i++){
-        const angle = Math.random()*2*Math.PI;
-        const speed = Math.random()*0.3+0.1;
-        points.userData.vels.push(new THREE.Vector3(Math.cos(angle)*speed, Math.random()*0.2, Math.sin(angle)*speed));
-    }
-    scene.add(points);
-    bursts.push(points);
+function clamp(v,min,max){ return Math.max(min, Math.min(max,v)); }
+
+/* =========================================================
+   “Screen” system (each wall is independent & updateable)
+   - Each screen has its own canvas + CanvasTexture
+   ========================================================= */
+const screens = new Map(); // id -> {canvas, ctx, texture, mesh, lastPayload}
+
+function makeScreenCanvas(id){
+  const c = document.createElement("canvas");
+  c.width = 512;
+  c.height = 256;
+  const ctx = c.getContext("2d");
+
+  // initial draw
+  drawScreen(ctx, id, { status: "waiting", note: "no data yet" });
+
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.minFilter = THREE.LinearFilter;
+  tex.magFilter = THREE.LinearFilter;
+  return { canvas:c, ctx, texture:tex };
 }
 
-// Mock chart
-function createMockChart(type){
-    const size=128;
-    const canvas=document.createElement('canvas');
-    canvas.width=size; canvas.height=size;
-    const ctx=canvas.getContext('2d');
-    ctx.clearRect(0,0,size,size);
-    ctx.fillStyle="rgba(20,20,40,0.8)";
-    ctx.beginPath(); ctx.arc(size/2,size/2,size/2-5,0,2*Math.PI); ctx.fill();
-    ctx.strokeStyle="#33ccff"; ctx.lineWidth=6;
-    if(type==="circle"){ ctx.beginPath(); ctx.arc(size/2,size/2,size/2-10,0,Math.random()*2*Math.PI); ctx.stroke(); }
-    else if(type==="line"){ ctx.beginPath(); ctx.moveTo(10,size-10); for(let i=0;i<10;i++){ const x=i*(size-20)/9+10; const y=size-10-Math.random()*(size-20); ctx.lineTo(x,y);} ctx.stroke();}
-    else if(type==="disk"){ let start=0; for(let i=0;i<3;i++){ const value=Math.random()*0.3+0.2; ctx.beginPath(); ctx.moveTo(size/2,size/2); ctx.arc(size/2,size/2,size/2-10,start,start+2*Math.PI*value); ctx.closePath(); ctx.stroke(); start+=2*Math.PI*value;}}
-    return new THREE.CanvasTexture(canvas);
-}
+function drawScreen(ctx, id, payload){
+  const W = ctx.canvas.width, H = ctx.canvas.height;
 
-// Initialize scene
-function init(){
-    scene=new THREE.Scene();
-    camera=new THREE.PerspectiveCamera(75, window.innerWidth/window.innerHeight,0.1,2000);
-    renderer=new THREE.WebGLRenderer({antialias:true});
-    renderer.setSize(window.innerWidth,window.innerHeight);
-    document.body.appendChild(renderer.domElement);
+  // clean, neutral UI
+  ctx.clearRect(0,0,W,H);
+  ctx.fillStyle = "#0f141a";
+  ctx.fillRect(0,0,W,H);
 
-    scene.add(new THREE.AmbientLight(0x3311aa,1.2));
-    const pointLight=new THREE.PointLight(0x33ccff,2.5,1000);
-    pointLight.position.set(0,0,400);
-    scene.add(pointLight);
+  // header bar
+  ctx.fillStyle = "#171f27";
+  ctx.fillRect(0,0,W,56);
 
-    const cubeWidth=200, cubeHeight=100, cubeDepth=300, cubeSeparation=150;
+  // title
+  ctx.fillStyle = "#e9eef5";
+  ctx.font = "700 22px system-ui, -apple-system, Segoe UI, sans-serif";
+  ctx.fillText(id.toUpperCase(), 18, 36);
 
-    for(let levelIdx=0; levelIdx<2; levelIdx++){
-        const levelY=levelIdx*cubeSeparation;
+  // status chip
+  const status = (payload && payload.status) ? String(payload.status) : "unknown";
+  const chip = status.toUpperCase();
+  const chipW = Math.min(220, 18 + ctx.measureText(chip).width + 18);
+  ctx.fillStyle = status === "live" ? "#204f3a" : "#2a3340";
+  roundRect(ctx, W - chipW - 18, 14, chipW, 28, 14, true, false);
+  ctx.fillStyle = "#e9eef5";
+  ctx.font = "700 14px system-ui";
+  ctx.fillText(chip, W - chipW - 18 + 16, 34);
 
-        const cubeGeo=new THREE.BoxGeometry(cubeWidth,cubeHeight,cubeDepth);
-        const edges=new THREE.EdgesGeometry(cubeGeo);
-        const edge1=new THREE.LineSegments(edges,new THREE.LineBasicMaterial({color:0x00ffff,linewidth:2}));
-        const edge2=new THREE.LineSegments(edges,new THREE.LineBasicMaterial({color:0xff33ff,linewidth:1}));
-        edge1.position.y=edge2.position.y=levelY;
-        scene.add(edge1,edge2);
+  // body
+  ctx.fillStyle = "#c8d2de";
+  ctx.font = "500 16px system-ui";
+  const note = payload?.note ? String(payload.note) : "Click quarters to focus. Scroll to zoom.";
+  wrapText(ctx, note, 18, 86, W-36, 22);
 
-        const backIcons=[ new THREE.Vector3(-40,10,-cubeDepth/2+1), new THREE.Vector3(0,0,-cubeDepth/2+1), new THREE.Vector3(40,-10,-cubeDepth/2+1) ];
-        const sideIcons=[ new THREE.Vector3(-cubeWidth/2+1,30,-100), new THREE.Vector3(-cubeWidth/2+1,-20,-50), new THREE.Vector3(cubeWidth/2-1,10,-80), new THREE.Vector3(cubeWidth/2-1,-15,-120) ];
-        const allIcons=backIcons.concat(sideIcons);
-        const neonColors=[0x00ffff,0xff33ff,0x33ff33,0xffff33];
-        const chartTypes=["circle","line","disk"];
+  // “quarters” hint lines
+  ctx.strokeStyle = "rgba(255,255,255,0.12)";
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.moveTo(W/2, 56); ctx.lineTo(W/2, H);
+  ctx.moveTo(0, (H+56)/2); ctx.lineTo(W, (H+56)/2);
+  ctx.stroke();
 
-        allIcons.forEach((pos,i)=>{
-            const color=neonColors[i%neonColors.length];
-            const iconGeo=new THREE.PlaneGeometry(35,35);
-            const iconMat=new THREE.MeshStandardMaterial({
-                map:createMockChart(chartTypes[i%chartTypes.length]),
-                transparent:true, opacity:0.85, metalness:0.8, roughness:0.05,
-                emissive:color, emissiveIntensity:1.2
-            });
-            const icon=new THREE.Mesh(iconGeo,iconMat);
-            icon.position.copy(pos); icon.position.y+=levelY;
-            icon.userData.isSideWall=(pos.x<-cubeWidth/4 || pos.x>cubeWidth/4);
-            if(icon.userData.isSideWall) icon.rotation.y = (pos.x<0)? Math.PI/2 : -Math.PI/2;
-            icon.userData.defaultRot = icon.rotation.clone();
-            icon.userData.tier = levelIdx;
-            icon.userData.isZoomed=false;
-            icon.userData.tiltTarget=undefined;
-            icon.userData.pulseOffset=Math.random()*10;
-            scene.add(icon);
-            icons.push(icon);
-        });
-
-        if(levelIdx===0){
-            const haloGeo=new THREE.RingGeometry(12,16,32);
-            const haloMat=new THREE.MeshStandardMaterial({color:0xffff00, emissive:0xffff00, transparent:true, opacity:0.8, side:THREE.DoubleSide});
-            haloIcon = new THREE.Mesh(haloGeo,haloMat);
-            haloIcon.position.set(0, levelY + cubeHeight/2, -cubeDepth/2 + 5);
-            haloIcon.userData.isUpDown=true;
-            scene.add(haloIcon);
-            icons.push(haloIcon);
-        }
-    }
-
-    // Input
-    let lastTouch=null, touching=false;
-    function startTouch(x,y){ touching=true; lastTouch={x,y}; }
-    function moveTouch(x,y){
-        if(!touching) return;
-        const dx=(x-lastTouch.x)/window.innerWidth*0.2;
-        const dy=(y-lastTouch.y)/window.innerHeight*0.2;
-        lastTouch={x,y};
-    }
-
-    function handlePointer(x,y){
-        mouse.x=(x/window.innerWidth)*2-1;
-        mouse.y=-(y/window.innerHeight)*2+1;
-        raycaster.setFromCamera(mouse,camera);
-        const intersects=raycaster.intersectObjects(icons);
-        if(intersects.length>0){
-            const obj=intersects[0].object;
-            clickAudio.currentTime=0; clickAudio.play();
-
-            if(obj.userData.isUpDown){
-                moveToTier(obj.position.y > cameraPosTarget.y ? 1 : 0);
-            } else if(obj.userData.tier===currentTier){
-                if(activeIcon===obj){ // toggle off
-                    activeIcon.userData.isZoomed=false;
-                    activeIcon=null;
-                    cameraPosTarget.set(0,20,150);
-                    cameraLookTarget.set(0,20,0);
-                    if(obj.userData.isSideWall) obj.userData.tiltTarget=0;
-                } else { // toggle on
-                    activeIcon=obj;
-                    obj.userData.isZoomed=true;
-                    softTone.currentTime=0; softTone.play();
-                    createBurst(obj.position);
-
-                    // Camera moves to cube center
-                    cameraPosTarget.set(0, obj.position.y, 0);
-                    cameraLookTarget.copy(obj.position);
-
-                    // Side-wall tilt
-                    if(obj.userData.isSideWall) obj.userData.tiltTarget=-0.35;
-                }
-            }
-        } else { // clicked empty space
-            if(activeIcon){
-                if(activeIcon.userData.isSideWall) activeIcon.userData.tiltTarget=0;
-                activeIcon.userData.isZoomed=false;
-                activeIcon=null;
-                cameraPosTarget.set(0,20,150);
-                cameraLookTarget.set(0,20,0);
-            }
-        }
-    }
-
-    window.addEventListener("mousedown", e=>{ handlePointer(e.clientX,e.clientY); startTouch(e.clientX,e.clientY); });
-    window.addEventListener("mousemove", e=>{ moveTouch(e.clientX,e.clientY); });
-    window.addEventListener("mouseup", ()=>{ touching=false; });
-    window.addEventListener("touchstart", e=>{ handlePointer(e.touches[0].clientX,e.touches[0].clientY); startTouch(e.touches[0].clientX,e.touches[0].clientY); }, {passive:false});
-    window.addEventListener("touchmove", e=>{ moveTouch(e.touches[0].clientX,e.touches[0].clientY); }, {passive:false});
-    window.addEventListener("touchend", ()=>{ touching=false; });
-    window.addEventListener("resize", ()=>{
-        camera.aspect=window.innerWidth/window.innerHeight;
-        camera.updateProjectionMatrix();
-        renderer.setSize(window.innerWidth,window.innerHeight);
+  // live values area (optional)
+  if (payload && payload.values && typeof payload.values === "object"){
+    const entries = Object.entries(payload.values).slice(0,6);
+    ctx.fillStyle = "#e9eef5";
+    ctx.font = "700 14px system-ui";
+    let y = H - 86;
+    entries.forEach(([k,v])=>{
+      ctx.fillText(`${k}:`, 18, y);
+      ctx.font = "500 14px system-ui";
+      ctx.fillStyle = "#c8d2de";
+      ctx.fillText(String(v), 140, y);
+      ctx.fillStyle = "#e9eef5";
+      ctx.font = "700 14px system-ui";
+      y += 20;
     });
+  }
 }
 
-function moveToTier(tier){
-    currentTier=tier;
-    cameraPosTarget.y = tier*150 + 20;
-    cameraLookTarget.y = tier*150 + 20;
+function roundRect(ctx,x,y,w,h,r,fill,stroke){
+  ctx.beginPath();
+  ctx.moveTo(x+r,y);
+  ctx.arcTo(x+w,y,x+w,y+h,r);
+  ctx.arcTo(x+w,y+h,x,y+h,r);
+  ctx.arcTo(x,y+h,x,y,r);
+  ctx.arcTo(x,y,x+w,y,r);
+  ctx.closePath();
+  if(fill) ctx.fill();
+  if(stroke) ctx.stroke();
 }
 
+function wrapText(ctx, text, x, y, maxWidth, lineHeight){
+  const words = String(text).split(" ");
+  let line = "";
+  for (let n=0;n<words.length;n++){
+    const test = line + words[n] + " ";
+    if (ctx.measureText(test).width > maxWidth && n>0){
+      ctx.fillText(line, x, y);
+      line = words[n] + " ";
+      y += lineHeight;
+    } else line = test;
+  }
+  ctx.fillText(line, x, y);
+}
+
+/* =========================================================
+   Build the room: 4 wall screens (front/back/left/right)
+   ========================================================= */
+function addWallScreen(face){
+  const { w,h,d } = ROOM;
+
+  const { canvas, ctx, texture } = makeScreenCanvas(face);
+
+  // plane sizes:
+  // front/back are w×h, side walls are d×h (because they run along depth)
+  const planeW = (face==="left" || face==="right") ? d : w;
+  const planeH = h;
+
+  const geo = new THREE.PlaneGeometry(planeW, planeH);
+
+  const mat = new THREE.MeshStandardMaterial({
+    map: texture,
+    metalness: 0.0,
+    roughness: 1.0
+  });
+
+  const mesh = new THREE.Mesh(geo, mat);
+
+  // position/orientation per face
+  if (face==="front"){
+    mesh.position.set(0, TIER_Y,  d/2);
+    mesh.rotation.y = 0;
+  } else if (face==="back"){
+    mesh.position.set(0, TIER_Y, -d/2);
+    mesh.rotation.y = Math.PI;
+  } else if (face==="left"){
+    mesh.position.set(-w/2, TIER_Y, 0);
+    mesh.rotation.y = Math.PI/2;
+  } else if (face==="right"){
+    mesh.position.set( w/2, TIER_Y, 0);
+    mesh.rotation.y = -Math.PI/2;
+  }
+
+  mesh.userData = { type:"screen", face, planeW, planeH };
+
+  scene.add(mesh);
+  clickables.push(mesh);
+
+  screens.set(face, { canvas, ctx, texture, mesh, lastPayload:null });
+}
+
+/* =========================================================
+   Click-to-face logic with quarter targeting
+   - Side walls: pull to center, then rotate/focus
+   ========================================================= */
+function computeQuarterLookPoint(hit){
+  const wall = hit.object;
+  const face = wall.userData.face;
+
+  // hit.uv ranges 0..1 across the plane
+  const uv = hit.uv || {x:0.5,y:0.5};
+  const qx = (uv.x < 0.5) ? -1 : 1;  // left/right
+  const qy = (uv.y < 0.5) ? -1 : 1;  // bottom/top
+
+  // offsets on wall plane
+  const { w,h,d } = ROOM;
+  const dy = (h * 0.25) * qy;
+
+  // front/back horizontal axis is X, side walls horizontal axis is Z
+  const center = wall.position.clone();
+  const p = center.clone();
+
+  if (face==="front" || face==="back"){
+    const dx = (w * 0.25) * qx;
+    p.x += dx; p.y += dy;
+  } else {
+    const dz = (d * 0.25) * qx;
+    p.z += dz; p.y += dy;
+  }
+  return p;
+}
+
+function camPointForFace(face, lookPoint){
+  const y = lookPoint.y;
+
+  if (face==="front") return new THREE.Vector3(0, y,  ROOM.d/2 + zoomDist);
+  if (face==="back")  return new THREE.Vector3(0, y, -ROOM.d/2 - zoomDist);
+  if (face==="left")  return new THREE.Vector3(-ROOM.w/2 - zoomDist, y, 0);
+  return                 new THREE.Vector3( ROOM.w/2 + zoomDist, y, 0); // right
+}
+
+function focusWall(hit){
+  const wall = hit.object;
+  const face = wall.userData.face;
+  const lookPoint = computeQuarterLookPoint(hit);
+  const isSide = (face==="left" || face==="right");
+
+  focus = {
+    phase: isSide ? "pull" : "face",
+    face,
+    lookPoint,
+    wall,
+    isSide,
+    centerPoint: new THREE.Vector3(0, TIER_Y, CENTER_PULL_Z),
+    camPoint: null
+  };
+
+  if (focus.phase === "pull"){
+    cameraPosTarget.copy(focus.centerPoint);
+    cameraLookTarget.set(0, TIER_Y, 0);
+  } else {
+    focus.camPoint = camPointForFace(face, lookPoint);
+    cameraPosTarget.copy(focus.camPoint);
+    cameraLookTarget.copy(lookPoint);
+  }
+
+  // little visual “ack” on click: update the screen status momentarily
+  const s = screens.get(face);
+  if (s){
+    s.lastPayload = s.lastPayload || { status:"live", note:"" };
+    const next = { ...s.lastPayload, status:"live", note:`Focused: ${face} (${lookQuadrantLabel(hit.uv)})` };
+    applyScreenPayload(face, next);
+  }
+}
+
+function lookQuadrantLabel(uv){
+  if(!uv) return "center";
+  const lr = uv.x < 0.5 ? "L" : "R";
+  const tb = uv.y < 0.5 ? "B" : "T";
+  return tb + lr; // TL, TR, BL, BR (with our UV convention)
+}
+
+/* =========================================================
+   Real-time update plumbing
+   - applyScreenPayload(face, payload)
+   - SSE if available, else polling
+   ========================================================= */
+function applyScreenPayload(face, payload){
+  const s = screens.get(face);
+  if(!s) return;
+  s.lastPayload = payload;
+  drawScreen(s.ctx, face, payload);
+  s.texture.needsUpdate = true;
+}
+
+function startRealtime(){
+  // SSE (best)
+  if (SSE_URL){
+    try{
+      const es = new EventSource(SSE_URL);
+      es.onmessage = (ev)=>{
+        try{
+          const msg = JSON.parse(ev.data);
+          // expected: {screenId:"front", payload:{status:"live", note:"...", values:{...}}}
+          if (msg && msg.screenId && msg.payload){
+            applyScreenPayload(String(msg.screenId), msg.payload);
+          }
+        }catch(_){}
+      };
+      es.onerror = ()=>{/* let it retry */};
+      return;
+    }catch(_){}
+  }
+
+  // Polling fallback
+  if (POLL_URL){
+    setInterval(async ()=>{
+      for (const id of screens.keys()){
+        try{
+          const u = new URL(POLL_URL);
+          u.searchParams.set("id", id);
+          const r = await fetch(u.toString(), { cache:"no-store" });
+          if(!r.ok) continue;
+          const payload = await r.json().catch(()=>null);
+          if(payload) applyScreenPayload(id, payload);
+        }catch(_){}
+      }
+    }, POLL_MS);
+    return;
+  }
+
+  // No backend wired yet -> demo updates
+  setInterval(()=>{
+    for (const id of screens.keys()){
+      applyScreenPayload(id, {
+        status: "live",
+        note: "Demo mode (wire SSE_URL or POLL_URL)",
+        values: {
+          time: new Date().toLocaleTimeString(),
+          cpu: (Math.random()*60+20).toFixed(0)+"%",
+          jobs: (Math.random()*9+1).toFixed(0),
+        }
+      });
+    }
+  }, 1200);
+}
+
+/* =========================================================
+   Input
+   ========================================================= */
+function handlePointer(x,y){
+  mouse.x = (x/window.innerWidth)*2 - 1;
+  mouse.y = -(y/window.innerHeight)*2 + 1;
+  raycaster.setFromCamera(mouse, camera);
+
+  const hits = raycaster.intersectObjects(clickables, true);
+  if(!hits.length){
+    // click empty -> back to overview
+    focus = null;
+    cameraPosTarget.set(OVERVIEW.x, OVERVIEW.y, OVERVIEW.z);
+    cameraLookTarget.set(0, 20, 0);
+    return;
+  }
+  focusWall(hits[0]);
+}
+
+/* =========================================================
+   Animate
+   ========================================================= */
 function animate(){
-    requestAnimationFrame(animate);
-    const time=performance.now()*0.002;
+  requestAnimationFrame(animate);
 
-    // --- Smooth camera movement ---
-    const moveDir = cameraPosTarget.clone().sub(camera.position);
-    const dist = moveDir.length();
-    const step = 0.8; // speed
-    if(dist > step){
-        moveDir.normalize().multiplyScalar(step);
-        camera.position.add(moveDir);
-    } else {
-        camera.position.copy(cameraPosTarget);
+  // side wall phase switch: pull -> face
+  if (focus && focus.phase === "pull"){
+    const dist = camera.position.distanceTo(cameraPosTarget);
+    if (dist < CENTER_PULL_THRESH){
+      focus.phase = "face";
+      focus.camPoint = camPointForFace(focus.face, focus.lookPoint);
+      cameraPosTarget.copy(focus.camPoint);
+      cameraLookTarget.copy(focus.lookPoint);
     }
+  }
 
-    // Smooth lookAt
-    const currentLook = camera.getWorldDirection(new THREE.Vector3()).normalize();
-    const desiredLook = cameraLookTarget.clone().sub(camera.position).normalize();
-    const smoothLook = currentLook.lerp(desiredLook, 0.05).normalize();
-    camera.lookAt(camera.position.clone().add(smoothLook));
+  // smooth move
+  const moveDir = cameraPosTarget.clone().sub(camera.position);
+  const dist = moveDir.length();
+  if (dist > CAM_STEP){
+    moveDir.normalize().multiplyScalar(CAM_STEP);
+    camera.position.add(moveDir);
+  } else {
+    camera.position.copy(cameraPosTarget);
+  }
 
-    // Icons
-    icons.forEach(icon=>{
-        if(icon.userData.isUpDown){
-            const pulse=1+0.05*Math.sin(time*5);
-            icon.scale.set(pulse,pulse,pulse);
-        } else if(icon.userData.tier===currentTier){
-            const pulse=1+0.05*Math.sin(time + (icon.userData.pulseOffset||0));
-            let scaleTarget = activeIcon===icon ? 1.5 : pulse;
-            icon.scale.x = icon.scale.y = icon.scale.z = THREE.MathUtils.lerp(icon.scale.x, scaleTarget,0.05);
+  // smooth look
+  const currentLook = camera.getWorldDirection(new THREE.Vector3()).normalize();
+  const desiredLook = cameraLookTarget.clone().sub(camera.position).normalize();
+  const smoothLook = currentLook.lerp(desiredLook, LOOK_LERP).normalize();
+  camera.lookAt(camera.position.clone().add(smoothLook));
 
-            if(icon.userData.isSideWall){
-                let targetRot = icon.userData.tiltTarget!==undefined ? icon.userData.tiltTarget : icon.userData.defaultRot.x;
-                icon.rotation.x = THREE.MathUtils.lerp(icon.rotation.x, targetRot,0.05);
-            }
-        } else {
-            icon.material.opacity = 0.3;
-        }
-    });
-
-    // Particle bursts
-    bursts.forEach((b,i)=>{
-        b.userData.life+=1;
-        const positions = b.geometry.attributes.position.array;
-        for(let j=0;j<positions.length;j+=3){
-            positions[j]+=b.userData.vels[j/3].x;
-            positions[j+1]+=b.userData.vels[j/3].y;
-            positions[j+2]+=b.userData.vels[j/3].z;
-        }
-        b.geometry.attributes.position.needsUpdate=true;
-        b.material.opacity *= 0.92;
-        if(b.userData.life>30){ scene.remove(b); bursts.splice(i,1); }
-    });
-
-    renderer.render(scene,camera);
+  renderer.render(scene, camera);
 }
 
-init();
-animate();
+/* =========================================================
+   Boot
+   ========================================================= */
+function boot(){
+  scene = new THREE.Scene();
+
+  // neutral lighting (no neon)
+  scene.add(new THREE.AmbientLight(0xffffff, 0.85));
+  const dir = new THREE.DirectionalLight(0xffffff, 0.75);
+  dir.position.set(180, 240, 200);
+  scene.add(dir);
+
+  camera = new THREE.PerspectiveCamera(75, window.innerWidth/window.innerHeight, 0.1, 2000);
+  camera.position.set(OVERVIEW.x, OVERVIEW.y, OVERVIEW.z);
+
+  renderer = new THREE.WebGLRenderer({ antialias:true });
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.setPixelRatio(Math.min(2, window.devicePixelRatio || 1));
+  document.body.appendChild(renderer.domElement);
+
+  // simple floor/space cue (subtle)
+  const floor = new THREE.Mesh(
+    new THREE.PlaneGeometry(900, 900),
+    new THREE.MeshStandardMaterial({ color: 0x0c1118, roughness: 1.0, metalness: 0.0 })
+  );
+  floor.rotation.x = -Math.PI/2;
+  floor.position.y = -60;
+  scene.add(floor);
+
+  // build the 4 independent screens
+  addWallScreen("front");
+  addWallScreen("right");
+  addWallScreen("back");
+  addWallScreen("left");
+
+  // input hooks
+  window.addEventListener("mousedown", e=> handlePointer(e.clientX,e.clientY));
+  window.addEventListener("touchstart", e=>{
+    handlePointer(e.touches[0].clientX, e.touches[0].clientY);
+  }, {passive:false});
+
+  // zoom (dolly)
+  window.addEventListener("wheel", (e)=>{
+    e.preventDefault();
+    zoomDist = clamp(zoomDist + e.deltaY * ZOOM_STEP, ZOOM_MIN, ZOOM_MAX);
+    if (focus && focus.phase === "face"){
+      focus.camPoint = camPointForFace(focus.face, focus.lookPoint);
+      cameraPosTarget.copy(focus.camPoint);
+    }
+  }, {passive:false});
+
+  window.addEventListener("resize", ()=>{
+    camera.aspect = window.innerWidth/window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+  });
+
+  // start updates
+  startRealtime();
+
+  animate();
+}
+
+boot();
 </script>
 </body>
 </html>
